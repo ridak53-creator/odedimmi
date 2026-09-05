@@ -148,6 +148,7 @@ const S = {
     gistId: '',
     token: '',
     passphrase: '',
+    notify: true,        // false → takvim dosyası boş yazılır, uyarı gelmez
     leadDays: 2,
     overdueDays: 14,
     alarmHour: 9,
@@ -318,6 +319,11 @@ async function syncNow(silent = false) {
     S.categories = merged.categories.length ? merged.categories : S.categories;
     S.members = merged.members.length ? merged.members : S.members;
 
+    // Karşı telefondan gelen ikizler burada temizlenir. Aşağıda kendi
+    // dosyamızı yazarken silme damgaları da gittiği için düzeltme öbür
+    // telefona da geçer.
+    dedupeOccurrences();
+
     const mine = {
       schema: 1, deviceId: S.deviceId, deviceName: S.deviceName,
       writtenAt: new Date().toISOString(),
@@ -484,6 +490,16 @@ function buildICS() {
     'X-PUBLISHED-TTL:PT1H', 'REFRESH-INTERVAL;VALUE=DURATION:PT1H'
   ];
 
+  // Bildirimler kapalıyken dosya SİLİNMEZ, boş takvim olarak yazılır. Sebep:
+  // dosyayı silersek adres 404 verir, iOS aboneliği güncelleyemez ve en son
+  // indirdiği etkinlikleri telefonda tutmaya devam eder. Geçerli ama boş bir
+  // takvim gönderirsek iOS mevcut etkinlikleri siler. Böylece hem uyarılar
+  // durur hem de Gist'teki dosyanın içinde tek bir ödeme bilgisi kalmaz.
+  if (S.cfg.notify === false) {
+    L.push('END:VCALENDAR');
+    return L.join('\r\n') + '\r\n';
+  }
+
   const open = alive().filter(p => !p.isPaid && p.reminder && p.kind === 'expense');
 
   // Takvim dosyası iOS tarafından saatte bir indirildiği için kayan bir
@@ -606,6 +622,18 @@ function futureOfSeries(p) {
     x.id !== p.id && seriesKey(x) === key && x.dueDate > p.dueDate && !x.isPaid);
 }
 
+/**
+ * Tekrar zincirinde üretilen kaydın kimliği.
+ *
+ * Rastgele uid() KULLANILMAZ — kasıtlı. İki telefon da açılışta materialize()
+ * çalıştırıyor ve bunu senkrondan ÖNCE yapıyor. Rastgele kimlikle, ikisi de
+ * aynı ayın kaydını kendi kimliğiyle üretiyor; birleştirme kimliğe baktığı
+ * için ikisi de hayatta kalıyor ve kayıt ikileniyor. Kimlik seriden ve
+ * vadeden türetilirse iki telefon aynı kimliği üretir, birleştirme de
+ * kendiliğinden tek kayda indirir.
+ */
+const occId = (seriesId, dueDate) => `${seriesId}~${dueDate}`;
+
 /** Ayın gün sayısını aşmayacak şekilde tarihin gününü değiştirir. */
 function setDayOfMonth(iso, day) {
   const [y, m] = iso.split('-').map(Number);
@@ -677,8 +705,8 @@ function spawnNext(p) {
   const next = step(p.dueDate);
   if (p.recurrenceEnd && next > p.recurrenceEnd) return;
   const series = p.seriesId || p.id;
-  if (S.payments.some(x => !x.deleted && (x.seriesId === series || x.id === series) && x.dueDate === next)) return;
-  S.payments.push(touch({ ...p, id: uid(), seriesId: series, dueDate: next, isPaid: false, paidAmount: 0, paidDate: null }));
+  if (S.payments.some(x => (x.seriesId === series || x.id === series) && x.dueDate === next)) return;
+  S.payments.push(touch({ ...p, id: occId(series, next), seriesId: series, dueDate: next, isPaid: false, paidAmount: 0, paidDate: null }));
 }
 
 /** Uygulama açılışında eksik tekrarları tamamlar (3 ay ilerisine kadar). */
@@ -688,20 +716,70 @@ function materialize(untilISO) {
   const horizon = untilISO || addMonths(todayISO(), 12);
   for (let guard = 0; guard < 400; guard++) {
     let added = false;
-    for (const p of S.payments.filter(x => !x.deleted && x.recurrence !== 'none')) {
+    // Silinmiş kayıtların üzerinden de adımlanır — zincirin ortasındaki bir ayı
+    // sildiğinde sonraki aylar üretilmeye devam etsin diye. Ama dolu slot
+    // kontrolü silinmişleri DE sayar, yoksa sildiğin ay geri geliyor.
+    for (const p of S.payments.filter(x => x.recurrence !== 'none')) {
       const step = STEP[p.recurrence];
       if (!step) continue;
       const next = step(p.dueDate);
       if (next > horizon) continue;
       if (p.recurrenceEnd && next > p.recurrenceEnd) continue;
       const series = p.seriesId || p.id;
-      if (S.payments.some(x => !x.deleted && (x.seriesId === series || x.id === series) && x.dueDate === next)) continue;
-      S.payments.push(touch({ ...p, id: uid(), seriesId: series, dueDate: next, isPaid: false, paidAmount: 0, paidDate: null }));
+      if (S.payments.some(x => (x.seriesId === series || x.id === series) && x.dueDate === next)) continue;
+      S.payments.push(touch({ ...p, id: occId(series, next), seriesId: series, dueDate: next, isPaid: false, paidAmount: 0, paidDate: null }));
       added = true;
     }
     if (!added) break;
   }
+  dedupeOccurrences();
   S.payments.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+}
+
+/**
+ * Aynı slotu (aynı seri + aynı vade, ya da aynı taksit planının aynı sırası)
+ * dolduran birden fazla kaydı teke indirir. Eskiden rastgele kimlikle üretilmiş
+ * ikizleri temizler; deterministik kimliğe geçtikten sonra yenisi oluşmaz.
+ *
+ * Ödenmiş kayda dokunulmaz: bir slotta ödenmiş ve ödenmemiş kopya varsa
+ * ödenmiş olan kalır. İkisi de ödenmişse hiçbiri silinmez, yalnızca sayılır —
+ * gerçek bir çift ödeme olabilir, karar kullanıcının.
+ */
+function dedupeOccurrences({ apply = true } = {}) {
+  const slots = new Map();
+  for (const p of S.payments) {
+    if (p.deleted) continue;
+    let key = null;
+    if (p.installment && p.installment.groupId) {
+      key = `inst:${p.installment.groupId}:${p.installment.index}`;
+    } else if (p.seriesId) {
+      key = `ser:${seriesKey(p)}:${p.dueDate}`;
+    }
+    if (!key) continue;
+    if (!slots.has(key)) slots.set(key, []);
+    slots.get(key).push(p);
+  }
+
+  let removed = 0, conflicts = 0;
+  for (const [, group] of slots) {
+    if (group.length < 2) continue;
+    const paid = group.filter(p => p.isPaid);
+    if (paid.length > 1) { conflicts++; continue; }
+
+    // Tutulacak kayıt: ödenmiş olan; yoksa deterministik kimliğe sahip olan;
+    // o da yoksa en eski (ilk yazılan) kayıt.
+    const keep = paid[0]
+      || group.find(p => p.id === occId(seriesKey(p), p.dueDate))
+      || group.slice().sort((a, b) =>
+           String(a.updatedAt || '').localeCompare(String(b.updatedAt || '')))[0];
+
+    for (const p of group) {
+      if (p === keep) continue;
+      removed++;
+      if (apply) { p.deleted = true; touch(p); }
+    }
+  }
+  return { removed, conflicts };
 }
 
 function createInstallments(base, count, splitTotal) {
@@ -1188,6 +1266,8 @@ function viewStats() {
 
 function viewSettings() {
   // Takvim adresi ayrı Gist ayarlıysa ondan, değilse ana Gist'ten üretilir.
+  const notifOn = S.cfg.notify !== false;
+  const off = notifOn ? '' : ' disabled';
   const icsHost = (S.cfg.icsGistId || '').trim() || S.cfg.gistId;
   const icsURL = icsHost && S.cfg.gistUser
     ? `https://gist.githubusercontent.com/${S.cfg.gistUser}/${icsHost}/raw/takvim.ics` : '';
@@ -1214,25 +1294,31 @@ function viewSettings() {
 
   <div class="card">
     <h2>Bildirimler (Takvim aboneliği)</h2>
+    <div class="switch"><div class="lbl">Bildirimler açık
+      <small>${notifOn
+        ? 'Yaklaşan ödemeler takvim dosyasına yazılır'
+        : '<strong>Kapalı.</strong> Takvim dosyası boş yazılıyor — içinde hiçbir ödeme bilgisi yok'}</small></div>
+      <input type="checkbox" id="cfgNotify" ${notifOn ? 'checked' : ''}></div>
+    ${notifOn ? '' : '<div class="note">Kapalıyken Gist\'teki <code>takvim.ics</code> dosyası boş bir takvim olarak yazılmaya devam eder. Dosyayı silmek yerine boşaltmak gerekiyor: adres 404 verirse iOS aboneliği güncelleyemez ve en son indirdiği ödemeleri telefonda göstermeye devam eder. Boş takvimde ise iOS eski etkinlikleri temizler. Aboneliği telefondan kaldırmana gerek yok, tekrar açtığında kendiliğinden dolar.</div>'}
     ${icsURL ? `<div class="note">Takvim adresin:<br><code>${esc(icsURL)}</code></div>
       <button class="btn ghost js-copyics">Adresi kopyala</button>`
     : '<div class="note">Önce yukarıdan Gist ID ve kullanıcı adını kaydet.</div>'}
     <div class="note"><strong>iPhone'da:</strong> Ayarlar → Uygulamalar → Takvim → Takvim Hesapları → Hesap Ekle → Diğer → <strong>Abone Olunan Takvim Ekle</strong> → adresi yapıştır. <strong>“Uyarıları Sil” kapalı olmalı</strong>, yoksa hatırlatma gelmez.</div>
     <label class="field"><span>Kaç gün önce başlasın</span>
-      <input type="number" id="cfgLead" min="0" max="7" value="${S.cfg.leadDays}"></label>
+      <input type="number" id="cfgLead" min="0" max="7" value="${S.cfg.leadDays}"${off}></label>
     <label class="field"><span>Gecikince kaç gün devam etsin</span>
-      <input type="number" id="cfgOver" min="1" max="30" value="${S.cfg.overdueDays}"></label>
+      <input type="number" id="cfgOver" min="1" max="30" value="${S.cfg.overdueDays}"${off}></label>
     <label class="field"><span>Hatırlatma saati</span>
-      <input type="number" id="cfgHour" min="0" max="23" value="${S.cfg.alarmHour}"></label>
+      <input type="number" id="cfgHour" min="0" max="23" value="${S.cfg.alarmHour}"${off}></label>
     <label class="field"><span>Takvime kaç günlük ödeme yazılsın</span>
-      <input type="number" id="cfgWin" min="7" max="180" value="${S.cfg.icsWindowDays ?? 31}"></label>
+      <input type="number" id="cfgWin" min="7" max="180" value="${S.cfg.icsWindowDays ?? 31}"${off}></label>
     <div class="note">Takvim dosyası Gist'te <strong>şifresiz</strong> durmak zorunda — iOS Takvim'in okuyabilmesi için. Bu yüzden içine yalnızca yakın vadeli ödemeler yazılıyor. 31 gün, bildirimlerden bir şey kaybettirmeden listeyi kısa tutar.</div>
     <label class="field"><span>Takvim için ayrı Gist ID <em class="ok">isteğe bağlı</em></span>
       <input type="text" id="cfgIcsGist" value="${esc(S.cfg.icsGistId || '')}" placeholder="boş bırakırsan ana Gist kullanılır" autocapitalize="off" spellcheck="false"></label>
     <div class="note">Takvim adresi iki telefonun Takvim ayarlarında açıkta duruyor ve içinde Gist ID geçiyor. Ayrı bir gizli Gist açıp ID'sini buraya yazarsan, o adres sızsa bile <strong>veri dosyalarına ulaşılamaz</strong> — sızan şey yalnızca yaklaşan ödemelerin listesi olur.<br><br><strong>Değiştirirsen:</strong> iki telefonda da eski takvim aboneliğini <strong>sil</strong>, yeni adresle yeniden ekle. Eski aboneliği silmezsen o adres çalışmaya devam eder.</div>
     <div class="switch"><div class="lbl">Takvimde detay gizle
       <small>Başlık ve tutar yerine sadece “Ödeme var” yazar</small></div>
-      <input type="checkbox" id="cfgPriv" ${S.cfg.icsPrivacy ? 'checked' : ''}></div>
+      <input type="checkbox" id="cfgPriv" ${S.cfg.icsPrivacy ? 'checked' : ''}${off}></div>
     <button class="btn js-savenotif" style="margin-top:12px">Kaydet</button>
   </div>
 
@@ -1265,6 +1351,12 @@ function viewSettings() {
     <button class="btn ghost js-importfile">CSV dosyası seç</button>
     <button class="btn ghost js-export">CSV olarak dışa aktar</button>
     <input type="file" id="fileIn" accept=".csv,.txt,text/*" style="display:none">
+    <button class="btn ghost js-dedupe">İkilenmiş kayıtları denetle</button>
+    ${(() => {
+      const r = dedupeOccurrences({ apply: false });
+      if (r.conflicts) return `<div class="note err">${r.conflicts} slotta <strong>iki kopya da ödenmiş</strong> görünüyor. Bunlara dokunulmadı — gerçekten iki kez ödenmiş olabilir. Ödemeler ekranından bakıp gereksiz olanı elle sil.</div>`;
+      return '<div class="note">Aynı ayın tekrar kaydı ya da aynı taksit sırası iki kez oluşmuşsa kendiliğinden teke indirilir.</div>';
+    })()}
     <div class="note">Beklenen sütunlar: <code>Tarih;Başlık;Tür;Kategori;Tutar;Ödenen tutar;Para birimi;Durum</code> — isteğe bağlı <code>Kişi;Taksit;Tekrar;Not</code>. Aynı gün + aynı başlık + aynı tutar iki kez eklenmez.</div>
   </div>
 
@@ -1750,6 +1842,7 @@ function bindSettings() {
   });
 
   on('.js-savenotif', async () => {
+    S.cfg.notify = $('#cfgNotify').checked;
     S.cfg.leadDays = Math.max(0, Math.min(7, parseInt($('#cfgLead').value) || 0));
     S.cfg.overdueDays = Math.max(1, Math.min(30, parseInt($('#cfgOver').value) || 14));
     S.cfg.alarmHour = Math.max(0, Math.min(23, parseInt($('#cfgHour').value) || 9));
@@ -1758,7 +1851,8 @@ function bindSettings() {
     S.cfg.icsPrivacy = $('#cfgPriv').checked;
     saveLocal();
     await syncNow();
-    toast('Kaydedildi, takvim güncellendi');
+    toast(S.cfg.notify ? 'Kaydedildi, takvim güncellendi'
+                       : 'Bildirimler kapatıldı, takvim boşaltıldı', 4000);
   });
 
   on('.js-copyics', async () => {
@@ -1829,6 +1923,22 @@ function bindSettings() {
   });
 
   on('.js-recurtool', openRecurrenceTool);
+  on('.js-dedupe', async () => {
+    const r = dedupeOccurrences();
+    if (r.removed) { scheduleSync(); render(); }
+    toast(r.removed
+      ? `${r.removed} ikiz kayıt silindi${r.conflicts ? `, ${r.conflicts} tanesi elle bakmanı bekliyor` : ''}`
+      : (r.conflicts ? `${r.conflicts} slotta iki kopya da ödenmiş — elle bak` : 'İkilenmiş kayıt yok'), 4000);
+  });
+
+  const nt = $('#cfgNotify');
+  if (nt) nt.onchange = async () => {
+    S.cfg.notify = nt.checked;
+    saveLocal();
+    render();
+    await syncNow();
+  };
+
   on('.js-import', openImport);
   on('.js-export', () => download(`odedimmi-${todayISO()}.csv`, exportCSV()));
   on('.js-importfile', () => $('#fileIn').click());
