@@ -1,7 +1,7 @@
 // Ödedim mi — service worker
 // Uygulama kabuğunu önbelleğe alır, internet yokken de açılmasını sağlar.
 
-const CACHE = 'odedimmi-v4';
+const CACHE = 'odedimmi-v5';
 const SHELL = [
   './',
   './index.html',
